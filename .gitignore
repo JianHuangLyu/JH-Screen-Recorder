@@ -1,0 +1,36 @@
+# Build and release outputs
+*.exe
+.build-output-*/
+
+# FFmpeg is downloaded locally by setup_ffmpeg.ps1
+ffmpeg/bin/
+
+# Local recordings and temporary media
+*.mp4
+*.mkv
+*.wav
+*.tmp
+segment_*
+
+# User-specific UI exports and diagnostics
+JHCamera_UI設定.json
+report.txt
+*.log
+
+# Historical icon copies; keep the current unversioned assets
+assets/jh-camera-icon-*.ico
+
+# Separate experimental Unix implementation is not part of this Windows release
+JHCamera-Unix/
+
+# Local launch helpers superseded by JH錄影_v版本.exe
+start.bat
+start_hidden.vbs
+安裝FFmpeg.bat
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
