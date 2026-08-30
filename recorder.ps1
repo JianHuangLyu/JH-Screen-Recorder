@@ -42,7 +42,7 @@ if (-not $SmokeTest -and -not $AudioDiagnostics -and $env:RECORDER_PAUSE_DIAGNOS
 }
 
 $script:ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = "2.31"
+$script:AppVersion = "2.33"
 $script:WasapiLoopbackAvailable = $false
 $script:WasapiLoopbackError = ""
 $script:LoopbackCaptures = New-Object System.Collections.Generic.List[object]
@@ -98,6 +98,7 @@ $script:Paused = $false
 $script:PendingAction = ""
 $script:StartedAt = [DateTime]::Now
 $script:LastOutput = $null
+$script:LastScreenshotDirectory = ""
 $script:CloseAfterStop = $false
 $script:AudioDeviceMap = @{}
 $script:RecordingDevices = @()
@@ -645,10 +646,13 @@ $installFFmpeg = New-Button "偵測安裝" 550 370 115 38
 $installFFmpeg.Anchor = "Top,Right"
 $main.Controls.Add($installFFmpeg)
 
+$screenshotButton = New-Button "擷取截圖" 300 445 115 38
+$screenshotButton.Font = New-Object System.Drawing.Font("Microsoft JhengHei UI", 11, [System.Drawing.FontStyle]::Bold)
+$main.Controls.Add($screenshotButton)
 $record = New-Button "開始錄影" 425 445 115 38
 $record.Font = New-Object System.Drawing.Font("Microsoft JhengHei UI", 12, [System.Drawing.FontStyle]::Bold)
 $main.Controls.Add($record)
-$timerLabel = New-Label "00:00:00" 110 425 210 65
+$timerLabel = New-Label "00:00:00" 80 425 210 65
 $timerLabel.Font = New-Object System.Drawing.Font("Consolas", 20, [System.Drawing.FontStyle]::Bold)
 $timerLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $main.Controls.Add($timerLabel)
@@ -811,6 +815,10 @@ $script:SelectionBitmap = $null
 $script:SelectionStart = [System.Drawing.Point]::Empty
 $script:SelectionRectangle = [System.Drawing.Rectangle]::Empty
 $script:SelectionDragging = $false
+$script:SelectionPurpose = "recording"
+$script:SelectionMainWasVisible = $false
+$script:SelectionSelectorWasVisible = $false
+$script:SelectionToolbarWasVisible = $false
 
 $selectionOverlay = New-Object SmoothSelectionForm
 $selectionOverlay.Text = "自訂錄影範圍"
@@ -840,15 +848,18 @@ function Dispose-SelectionBitmap {
 function Restore-AfterCustomSelection {
     $selectionOverlay.Hide()
     Dispose-SelectionBitmap
-    $main.Show()
-    $selector.Show()
-    $selector.BringToFront()
-    $main.BringToFront()
+    if ($script:SelectionSelectorWasVisible) { $selector.Show() } else { $selector.Hide() }
+    if ($script:SelectionMainWasVisible) { $main.Show() } else { $main.Hide() }
+    if ($script:SelectionToolbarWasVisible) { Show-RecordingOverlay } else { $recordingOverlay.Hide() }
+    if ($selector.Visible) { $selector.BringToFront() }
+    if ($main.Visible) { $main.BringToFront(); $main.Activate() }
 }
 
 function Cancel-CustomSelection {
+    $cancelledPurpose = $script:SelectionPurpose
     Restore-AfterCustomSelection
-    $status.Text = "已取消自訂框選；錄影範圍未變更。"
+    $script:SelectionPurpose = "recording"
+    $status.Text = if ($cancelledPurpose -eq "screenshot") { "已取消螢幕截圖。" } else { "已取消自訂框選；錄影範圍未變更。" }
 }
 
 function Complete-CustomSelection([System.Drawing.Rectangle]$Rectangle) {
@@ -856,6 +867,10 @@ function Complete-CustomSelection([System.Drawing.Rectangle]$Rectangle) {
         $script:SelectionRectangle = [System.Drawing.Rectangle]::Empty
         $selectionOverlay.Invalidate()
         [System.Media.SystemSounds]::Beep.Play()
+        return
+    }
+    if ($script:SelectionPurpose -eq "screenshot") {
+        Complete-ScreenshotSelection $Rectangle
         return
     }
     $desktop = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -867,16 +882,31 @@ function Complete-CustomSelection([System.Drawing.Rectangle]$Rectangle) {
     )
     Set-CaptureSizeStatus $true
     Restore-AfterCustomSelection
+    $script:SelectionPurpose = "recording"
     $status.Text = "已自訂錄影範圍：$($Rectangle.Width) × $($Rectangle.Height)；仍可拖曳透明邊框微調。"
 }
 
-function Start-CustomSelection {
+function Start-SelectionOverlay(
+    [ValidateSet("recording", "screenshot")][string]$Purpose,
+    [System.Drawing.Bitmap]$SourceBitmap = $null
+) {
     $desktop = [System.Windows.Forms.SystemInformation]::VirtualScreen
     try {
+        $script:SelectionPurpose = $Purpose
+        $script:SelectionMainWasVisible = $main.Visible
+        $script:SelectionSelectorWasVisible = $selector.Visible
+        $script:SelectionToolbarWasVisible = $recordingOverlay.Visible
         $main.Hide()
         $selector.Hide()
+        $recordingOverlay.Hide()
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 150
+        # A pending Form.Shown event can briefly re-open the red selector or
+        # mini recording toolbar. Hide them again immediately before capture.
+        $main.Hide()
+        $selector.Hide()
+        $recordingOverlay.Hide()
+        [System.Windows.Forms.Application]::DoEvents()
 
         Dispose-SelectionBitmap
         $script:SelectionBitmap = New-Object System.Drawing.Bitmap(
@@ -886,14 +916,22 @@ function Start-CustomSelection {
         )
         $graphics = [System.Drawing.Graphics]::FromImage($script:SelectionBitmap)
         try {
-            $graphics.CopyFromScreen(
-                $desktop.Left,
-                $desktop.Top,
-                0,
-                0,
-                $desktop.Size,
-                [System.Drawing.CopyPixelOperation]::SourceCopy
-            )
+            if ($SourceBitmap) {
+                if ($SourceBitmap.Width -ne $desktop.Width -or $SourceBitmap.Height -ne $desktop.Height) {
+                    throw "框選測試畫面尺寸不符。"
+                }
+                $graphics.DrawImageUnscaled($SourceBitmap, 0, 0)
+            }
+            else {
+                $graphics.CopyFromScreen(
+                    $desktop.Left,
+                    $desktop.Top,
+                    0,
+                    0,
+                    $desktop.Size,
+                    [System.Drawing.CopyPixelOperation]::SourceCopy
+                )
+            }
         }
         finally {
             $graphics.Dispose()
@@ -909,9 +947,14 @@ function Start-CustomSelection {
     }
     catch {
         Restore-AfterCustomSelection
+        $script:SelectionPurpose = "recording"
         $status.Text = "無法開啟自訂框選：$($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($main, $_.Exception.Message, "自訂框選失敗", "OK", "Error") | Out-Null
     }
+}
+
+function Start-CustomSelection {
+    Start-SelectionOverlay "recording"
 }
 
 $selectionOverlay.Add_Paint({
@@ -961,7 +1004,12 @@ $selectionOverlay.Add_Paint({
         }
     }
 
-    $instruction = "按住滑鼠左鍵拖曳選取錄影範圍｜Esc 或滑鼠右鍵取消"
+    $instruction = if ($script:SelectionPurpose -eq "screenshot") {
+        "按住滑鼠左鍵拖曳框選截圖範圍｜Esc 或滑鼠右鍵取消"
+    }
+    else {
+        "按住滑鼠左鍵拖曳選取錄影範圍｜Esc 或滑鼠右鍵取消"
+    }
     $instructionFont = New-Object System.Drawing.Font("Microsoft JhengHei UI", 13, [System.Drawing.FontStyle]::Bold)
     $instructionBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
     $instructionBackground = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 24, 28, 34))
@@ -1202,6 +1250,7 @@ function Set-RecordingControls([bool]$IsRecording) {
     $installFFmpeg.Enabled = -not $IsRecording
     $customSelect.Enabled = -not $IsRecording
     $fitScreen.Enabled = -not $IsRecording
+    $screenshotButton.Enabled = -not $IsRecording
     $fps.Enabled = -not $IsRecording
     $quality.Enabled = -not $IsRecording
     $drawMouse.Enabled = -not $IsRecording
@@ -1288,6 +1337,131 @@ function Get-CaptureRectangle {
         throw "錄影範圍不在可擷取的桌面內，請將透明選取框移回螢幕。"
     }
     return New-Object System.Drawing.Rectangle($left, $top, $width, $height)
+}
+
+function Save-ScreenRectangleAsPng(
+    [System.Drawing.Rectangle]$Rectangle,
+    [string]$Path,
+    [System.Drawing.Bitmap]$SourceBitmap = $null
+) {
+    if ($Rectangle.Width -lt 1 -or $Rectangle.Height -lt 1) { throw "截圖範圍無效。" }
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "尚未指定截圖儲存位置。" }
+    $bitmap = New-Object System.Drawing.Bitmap(
+        $Rectangle.Width,
+        $Rectangle.Height,
+        [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+    )
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        if ($null -ne $SourceBitmap) {
+            if ($SourceBitmap.Width -ne $Rectangle.Width -or $SourceBitmap.Height -ne $Rectangle.Height) {
+                throw "截圖畫面尺寸不符。"
+            }
+            $graphics.DrawImageUnscaled($SourceBitmap, 0, 0)
+        }
+        else {
+            $graphics.CopyFromScreen(
+                $Rectangle.Left,
+                $Rectangle.Top,
+                0,
+                0,
+                $bitmap.Size,
+                [System.Drawing.CopyPixelOperation]::SourceCopy
+            )
+        }
+        $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
+function Copy-SelectionBitmapRegion([System.Drawing.Rectangle]$Rectangle) {
+    if (-not $script:SelectionBitmap) { throw "找不到可裁切的螢幕畫面。" }
+    $sourceBounds = New-Object System.Drawing.Rectangle(0, 0, $script:SelectionBitmap.Width, $script:SelectionBitmap.Height)
+    if ($Rectangle.Width -lt 1 -or $Rectangle.Height -lt 1 -or -not $sourceBounds.Contains($Rectangle)) {
+        throw "截圖框選範圍無效。"
+    }
+    $result = New-Object System.Drawing.Bitmap(
+        $Rectangle.Width,
+        $Rectangle.Height,
+        [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+    )
+    $graphics = [System.Drawing.Graphics]::FromImage($result)
+    try {
+        $destination = New-Object System.Drawing.Rectangle(0, 0, $Rectangle.Width, $Rectangle.Height)
+        $graphics.DrawImage($script:SelectionBitmap, $destination, $Rectangle, [System.Drawing.GraphicsUnit]::Pixel)
+    }
+    catch {
+        $result.Dispose()
+        throw
+    }
+    finally { $graphics.Dispose() }
+    return $result
+}
+
+function Complete-ScreenshotSelection([System.Drawing.Rectangle]$Rectangle) {
+    $selectedBitmap = $null
+    $dialog = $null
+    try {
+        # Crop from the frozen desktop image so the dark overlay, blue border,
+        # red recording frame, and recorder UI can never appear in the PNG.
+        $selectedBitmap = Copy-SelectionBitmapRegion $Rectangle
+        $selectionOverlay.Hide()
+        Dispose-SelectionBitmap
+
+        $initialDirectory = $script:LastScreenshotDirectory
+        if ([string]::IsNullOrWhiteSpace($initialDirectory)) { $initialDirectory = $outputPath.Text.Trim() }
+        if (-not (Test-Path -LiteralPath $initialDirectory -PathType Container)) {
+            $initialDirectory = [Environment]::GetFolderPath("MyPictures")
+        }
+        if ([string]::IsNullOrWhiteSpace($initialDirectory) -or -not (Test-Path -LiteralPath $initialDirectory -PathType Container)) {
+            $initialDirectory = [Environment]::GetFolderPath("MyVideos")
+        }
+        if ([string]::IsNullOrWhiteSpace($initialDirectory)) { $initialDirectory = $script:ProjectRoot }
+
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.Title = "選擇截圖儲存位置"
+        $dialog.Filter = "PNG 圖片|*.png"
+        $dialog.DefaultExt = "png"
+        $dialog.AddExtension = $true
+        $dialog.OverwritePrompt = $true
+        $dialog.RestoreDirectory = $true
+        $dialog.InitialDirectory = $initialDirectory
+        $dialog.FileName = "螢幕截圖_$([DateTime]::Now.ToString('yyyyMMdd_HHmmss')).png"
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+            Restore-AfterCustomSelection
+            $status.Text = "已取消螢幕截圖。"
+            return
+        }
+
+        $savePath = $dialog.FileName
+        $saveRectangle = New-Object System.Drawing.Rectangle(0, 0, $selectedBitmap.Width, $selectedBitmap.Height)
+        Save-ScreenRectangleAsPng $saveRectangle $savePath $selectedBitmap
+        $script:LastScreenshotDirectory = Split-Path -Parent $savePath
+        Restore-AfterCustomSelection
+        $status.Text = "截圖已儲存：$savePath"
+        [System.Windows.Forms.MessageBox]::Show($main, "截圖已儲存。`r`n`r`n$savePath", "截圖完成", "OK", "Information") | Out-Null
+    }
+    catch {
+        Restore-AfterCustomSelection
+        $status.Text = "截圖失敗：$($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show($main, $_.Exception.Message, "截圖失敗", "OK", "Error") | Out-Null
+    }
+    finally {
+        $script:SelectionPurpose = "recording"
+        if ($dialog) { $dialog.Dispose() }
+        if ($selectedBitmap) { $selectedBitmap.Dispose() }
+    }
+}
+
+function Capture-Screenshot {
+    if ($script:Recording -or $script:Paused) {
+        [System.Windows.Forms.MessageBox]::Show($main, "請先停止目前錄影，再使用獨立截圖功能。", "無法截圖", "OK", "Information") | Out-Null
+        return
+    }
+    Start-SelectionOverlay "screenshot"
 }
 
 function Stop-LoopbackCaptures {
@@ -1943,6 +2117,7 @@ $miniRecord.Add_Click({ Start-Recording })
 $miniPause.Add_Click({ Pause-Recording })
 $miniStop.Add_Click({ Stop-Recording })
 $customSelect.Add_Click({ Start-CustomSelection })
+$screenshotButton.Add_Click({ Capture-Screenshot })
 $fitScreen.Add_Click({
     $targetScreen = [System.Windows.Forms.Screen]::FromRectangle($selector.Bounds)
     $script:SuppressCaptureSizeStatus = $true
@@ -2194,9 +2369,36 @@ if ($SmokeTest) {
     if ($selectionOverlay.FormBorderStyle -ne "None" -or -not $selectionOverlay.TopMost -or $selectionOverlay.Cursor -ne [System.Windows.Forms.Cursors]::Cross) {
         throw "自訂框選畫面煙霧測試失敗。"
     }
+    $selectionDesktop = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $selectionTestSource = New-Object System.Drawing.Bitmap($selectionDesktop.Width, $selectionDesktop.Height)
+    try {
+        $main.Show()
+        $selector.Show()
+        Show-RecordingOverlay
+        Start-SelectionOverlay "screenshot" $selectionTestSource
+        if ($main.Visible -or $selector.Visible -or $recordingOverlay.Visible -or -not $selectionOverlay.Visible -or $script:SelectionPurpose -ne "screenshot") {
+            throw "截圖框選時隱藏錄影介面煙霧測試失敗：Main=$($main.Visible) Selector=$($selector.Visible) Toolbar=$($recordingOverlay.Visible) Overlay=$($selectionOverlay.Visible) Purpose=$($script:SelectionPurpose)"
+        }
+        Cancel-CustomSelection
+        if (-not $main.Visible -or -not $selector.Visible -or -not $recordingOverlay.Visible -or $selectionOverlay.Visible -or $script:SelectionPurpose -ne "recording") {
+            throw "取消截圖後恢復介面煙霧測試失敗。"
+        }
+    }
+    finally {
+        $selectionTestSource.Dispose()
+        $selectionOverlay.Hide()
+        Dispose-SelectionBitmap
+    }
     $selectionOverlay.Size = New-Object System.Drawing.Size(400, 300)
     $script:SelectionBitmap = New-Object System.Drawing.Bitmap(400, 300)
     $script:SelectionRectangle = New-Object System.Drawing.Rectangle(50, 50, 200, 120)
+    $selectionCrop = Copy-SelectionBitmapRegion $script:SelectionRectangle
+    try {
+        if ($selectionCrop.Width -ne 200 -or $selectionCrop.Height -ne 120) {
+            throw "截圖框選裁切尺寸煙霧測試失敗。"
+        }
+    }
+    finally { $selectionCrop.Dispose() }
     $renderedSelection = New-Object System.Drawing.Bitmap(400, 300)
     try {
         $selectionOverlay.DrawToBitmap($renderedSelection, (New-Object System.Drawing.Rectangle(0, 0, 400, 300)))
@@ -2227,9 +2429,38 @@ if ($SmokeTest) {
     if ($record.Size -ne $browseFFmpeg.Size -or $record.Size -ne $openFolder.Size -or $record.Left -ne $browseFFmpeg.Left -or $record.Top -ne $openFolder.Top) {
         throw "開始錄影按鈕大小及對齊煙霧測試失敗。"
     }
+    if ($screenshotButton.Text -ne "擷取截圖" -or $screenshotButton.Size -ne $record.Size -or $screenshotButton.Right -ge $record.Left -or $screenshotButton.Top -ne $record.Top) {
+        throw "獨立截圖按鈕版面煙霧測試失敗。"
+    }
     if ($timerLabel.TextAlign -ne [System.Drawing.ContentAlignment]::MiddleCenter) {
         throw "錄製時間置中煙霧測試失敗。"
     }
+    $screenshotTestPath = Join-Path ([IO.Path]::GetTempPath()) ("JHCameraScreenshotSmoke_" + [Guid]::NewGuid().ToString("N") + ".png")
+    try {
+        $screenshotTestRectangle = New-Object System.Drawing.Rectangle(0, 0, 32, 24)
+        $screenshotTestSource = New-Object System.Drawing.Bitmap(32, 24)
+        try {
+            $screenshotTestGraphics = [System.Drawing.Graphics]::FromImage($screenshotTestSource)
+            try { $screenshotTestGraphics.Clear([System.Drawing.Color]::CornflowerBlue) }
+            finally { $screenshotTestGraphics.Dispose() }
+            Save-ScreenRectangleAsPng $screenshotTestRectangle $screenshotTestPath $screenshotTestSource
+        }
+        finally { $screenshotTestSource.Dispose() }
+        if (-not (Test-Path -LiteralPath $screenshotTestPath -PathType Leaf)) { throw "截圖檔案未建立。" }
+        $screenshotTestImage = [System.Drawing.Image]::FromFile($screenshotTestPath)
+        try {
+            if ($screenshotTestImage.Width -ne 32 -or $screenshotTestImage.Height -ne 24 -or $screenshotTestImage.RawFormat.Guid -ne [System.Drawing.Imaging.ImageFormat]::Png.Guid) {
+                throw "截圖 PNG 尺寸或格式不正確。"
+            }
+        }
+        finally { $screenshotTestImage.Dispose() }
+    }
+    finally {
+        if (Test-Path -LiteralPath $screenshotTestPath -PathType Leaf) { Remove-Item -LiteralPath $screenshotTestPath -Force }
+    }
+    Set-RecordingControls $true
+    if ($screenshotButton.Enabled) { throw "錄影期間截圖按鈕停用煙霧測試失敗。" }
+    Set-RecordingControls $false
     $script:Recording = $true
     $script:Paused = $false
     $script:PendingAction = ""
@@ -2277,7 +2508,7 @@ if ($SmokeTest) {
     if ($main.Text -ne "JH Camera錄影程式 v$($script:AppVersion)" -or @($main.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and ($_.Text -eq "高畫質螢幕錄影＋錄音" -or $_.Text -like "版本號：v*") }).Count -ne 0) {
         throw "程式名稱與標題移除煙霧測試失敗。"
     }
-    if ($dateTimeLabel.Location -ne (New-Object System.Drawing.Point(25, 30)) -or $timerLabel.Location -ne (New-Object System.Drawing.Point(110, 425))) {
+    if ($dateTimeLabel.Location -ne (New-Object System.Drawing.Point(25, 30)) -or $timerLabel.Location -ne (New-Object System.Drawing.Point(80, 425))) {
         throw "匯入 UI 設定位置煙霧測試失敗。"
     }
     if ($processingForm.ClientSize.Width -ne 470 -or $processingForm.ClientSize.Height -ne 155) {
